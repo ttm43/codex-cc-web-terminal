@@ -86,6 +86,11 @@ let pendingOutput = "";
 let outputFrame = null;
 let viewportFrame = null;
 let keyboardWasOpen = false;
+let fittingTerminal = false;
+let lastSentCols = 0;
+let lastSentRows = 0;
+let lastFitWidth = 0;
+let lastFitHeight = 0;
 let imeComposing = false;
 let clipboardMode = "";
 let latestStatus = "Disconnected";
@@ -355,7 +360,7 @@ async function handleClipboardPrimaryAction() {
 
   sendToSession(formatTextForSessionPaste(text));
   closeClipboardSheet();
-  scrollTerminalToLatest();
+  scrollTerminalToLatest({ force: true });
   setStatus("Clipboard text sent to terminal.");
 }
 
@@ -365,10 +370,11 @@ function flushPendingOutput() {
     return;
   }
 
+  const wasAtBottom = isTerminalAtBottom();
   term.write(pendingOutput);
   pendingOutput = "";
-  if (keyboardWasOpen) {
-    scrollTerminalToLatest();
+  if (wasAtBottom) {
+    scrollTerminalToLatest({ force: true });
   }
 }
 
@@ -383,7 +389,42 @@ function queueTerminalOutput(chunk) {
   }
 }
 
-function scrollTerminalToLatest({ ensureVisible = false } = {}) {
+function isTextInputFocused() {
+  const element = document.activeElement;
+  if (!element || element === document.body) {
+    return false;
+  }
+
+  const tagName = element.tagName;
+  return tagName === "INPUT" || tagName === "TEXTAREA" || element.isContentEditable === true;
+}
+
+// Reading the buffer beats comparing scroll pixels: pixel offsets drift while
+// the mobile URL bar animates, which is exactly when we must not guess wrong.
+function isTerminalAtBottom() {
+  const buffer = term.buffer?.active;
+  if (buffer) {
+    return buffer.viewportY >= buffer.baseY;
+  }
+
+  const viewport = terminalRoot.querySelector(".xterm-viewport");
+  if (!viewport) {
+    return true;
+  }
+
+  return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 8;
+}
+
+// Stick-to-bottom is an explicit decision made by the caller. Pass force only
+// for a deliberate user action or for new output that arrived while already at
+// the bottom. Never call this from a viewport measurement path: measurements
+// fire on every visualViewport scroll, and snapping there steals the scroll
+// gesture the user is in the middle of.
+function scrollTerminalToLatest({ ensureVisible = false, force = false } = {}) {
+  if (!force && !isTerminalAtBottom()) {
+    return;
+  }
+
   const run = () => {
     if (ensureVisible) {
       terminalRoot.scrollIntoView({
@@ -408,9 +449,15 @@ function scrollTerminalToLatest({ ensureVisible = false } = {}) {
 }
 
 function settleTerminalViewport() {
+  let firstPass = true;
   const run = () => {
     requestViewportMetrics();
-    syncTerminalSize();
+    // The first pass re-fits even when the container reads the same size: a
+    // renderer that measured while the page was hidden can hold zeroed cell
+    // metrics, which makes fit() a silent no-op. Later passes only absorb
+    // layout settling, so they must not force and re-open the flapping window.
+    syncTerminalSize({ force: firstPass });
+    firstPass = false;
     scrollTerminalToLatest();
   };
 
@@ -556,7 +603,7 @@ function syncImeBridgeValue() {
 
   mobileComposerValue = nextValue;
   syncComposerLayout();
-  scrollTerminalToLatest();
+  scrollTerminalToLatest({ force: true });
 }
 
 function submitImeBridge() {
@@ -570,7 +617,7 @@ function submitImeBridge() {
   resetImeBridge();
   focusImeBridge();
   requestViewportMetrics();
-  scrollTerminalToLatest();
+  scrollTerminalToLatest({ force: true });
 }
 
 function flushImeBridgeValue() {
@@ -583,7 +630,11 @@ function applyViewportMetrics() {
   const viewportHeight = Math.round(viewport?.height || window.innerHeight);
   const viewportOffsetTop = Math.round(viewport?.offsetTop || 0);
   const keyboardInset = Math.max(0, window.innerHeight - viewportHeight);
-  const keyboardOpen = keyboardInset > 120;
+  // The inset alone latches: a stale visualViewport reading on resume from the
+  // background pins the layout into keyboard mode with no event left to release
+  // it. Requiring a focused text input gives the latch an unconditional exit.
+  const keyboardOpen = keyboardInset > 120 && isTextInputFocused();
+  const keyboardJustOpened = keyboardOpen && !keyboardWasOpen;
   document.documentElement.style.setProperty("--vvh", keyboardOpen ? `${viewportHeight}px` : "100dvh");
   document.documentElement.style.setProperty("--visual-viewport-height", `${viewportHeight}px`);
   document.documentElement.style.setProperty("--visual-viewport-offset-top", `${viewportOffsetTop}px`);
@@ -601,8 +652,8 @@ function applyViewportMetrics() {
     syncComposerLayout();
   }
   syncTerminalSize();
-  if (keyboardOpen) {
-    scrollTerminalToLatest();
+  if (keyboardJustOpened) {
+    scrollTerminalToLatest({ force: true });
   }
   if (
     keyboardOpen &&
@@ -1153,18 +1204,57 @@ async function refreshSessions() {
   updateInputControls();
 }
 
-function syncTerminalSize() {
-  fitAddon.fit();
-  scrollTerminalToLatest();
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(
-      JSON.stringify({
-        type: "resize",
-        cols: term.cols,
-        rows: term.rows
-      })
-    );
+function sendTerminalResize() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
   }
+
+  if (term.cols === lastSentCols && term.rows === lastSentRows) {
+    return;
+  }
+
+  lastSentCols = term.cols;
+  lastSentRows = term.rows;
+  socket.send(
+    JSON.stringify({
+      type: "resize",
+      cols: term.cols,
+      rows: term.rows
+    })
+  );
+}
+
+// fitAddon.fit() calls term.resize(), which fires term.onResize. Re-entering
+// fit() from that handler recurses until the stack blows, so the handler only
+// reports the new size and this guard covers any other path back in.
+//
+// Cell width is measured in device pixels and rounded, so on a fractional
+// devicePixelRatio it lands on two different values either side of a column
+// boundary. Re-fitting an unchanged container therefore flaps the column count
+// forever. Fit is a function of container size, so only run it when that moved.
+function syncTerminalSize({ force = false } = {}) {
+  if (fittingTerminal) {
+    return;
+  }
+
+  const rect = terminalRoot.getBoundingClientRect();
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
+  if (!force && width === lastFitWidth && height === lastFitHeight) {
+    sendTerminalResize();
+    return;
+  }
+
+  lastFitWidth = width;
+  lastFitHeight = height;
+  fittingTerminal = true;
+  try {
+    fitAddon.fit();
+  } finally {
+    fittingTerminal = false;
+  }
+
+  sendTerminalResize();
 }
 
 function disconnectSocket() {
@@ -1239,7 +1329,9 @@ async function connectToSession(sessionId, { resetTerminal = true, allowReconnec
 
   ws.addEventListener("open", async () => {
     setStatus("connected");
-    syncTerminalSize();
+    lastSentCols = 0;
+    lastSentRows = 0;
+    syncTerminalSize({ force: true });
     if (useImeBridge) {
       focusImeBridge();
     } else {
@@ -1255,7 +1347,7 @@ async function connectToSession(sessionId, { resetTerminal = true, allowReconnec
       activeSession = payload.session || activeSession;
       updateWorkspaceSummary();
       queueTerminalOutput(payload.buffer || "");
-      scrollTerminalToLatest();
+      scrollTerminalToLatest({ force: true });
       setStatus(payload.session.status || "running");
       return;
     }
@@ -1824,7 +1916,7 @@ if (!useImeBridge) {
 }
 
 term.onResize(() => {
-  syncTerminalSize();
+  sendTerminalResize();
 });
 
 terminalRoot.addEventListener("click", () => {
@@ -1849,7 +1941,7 @@ document.addEventListener("visibilitychange", () => {
     return;
   }
 
-  requestViewportMetrics();
+  settleTerminalViewport();
   if (!useImeBridge) {
     term.focus();
   }
@@ -1860,7 +1952,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("pageshow", () => {
-  requestViewportMetrics();
+  settleTerminalViewport();
   if (!useImeBridge) {
     term.focus();
   }
