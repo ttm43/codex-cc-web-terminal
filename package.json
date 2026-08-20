@@ -6,7 +6,7 @@
   "description": "Browser-based multi-session Codex/CC terminal for Windows and macOS.",
   "scripts": {
     "start": "node ./src/server.js",
-    "check": "node --check ./src/server.js && node --check ./src/config.js && node --check ./src/sessionManager.js && node --check ./public/app.js && node --check ./scripts/service.mjs && node --check ./scripts/launchd/manage.mjs",
+    "check": "node --check ./src/server.js && node --check ./src/config.js && node --check ./src/sessionManager.js && node --check ./src/terminalState.js && node --check ./public/app.js && node --check ./scripts/service.mjs && node --check ./scripts/launchd/manage.mjs",
     "pm2:dev": "pm2 startOrReload ecosystem.config.cjs --only codex-cc-web-terminal-dev --update-env",
     "pm2:prod": "pm2 startOrReload ecosystem.config.cjs --only codex-cc-web-terminal --update-env",
     "pm2:stop": "pm2 delete codex-cc-web-terminal codex-cc-web-terminal-dev",

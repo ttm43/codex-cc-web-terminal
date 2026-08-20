@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -76,6 +77,18 @@ function inferShellQuoteStyle(shellBin) {
 
 const root = process.cwd();
 const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
+
+// herdr installs to ~/.local/bin, which only login shells add to PATH. The pty
+// for a herdr client is spawned directly rather than through a shell, so prefer
+// the concrete path when it exists and fall back to PATH lookup otherwise.
+function inferHerdrBin() {
+  if (hasEnv("HERDR_BIN")) {
+    return env("HERDR_BIN");
+  }
+
+  const local = path.join(home, ".local", "bin", "herdr");
+  return fs.existsSync(local) ? local : "herdr";
+}
 const generatedToken = crypto.randomBytes(18).toString("base64url");
 const shellBin = env("SHELL_BIN", inferShellBin());
 const shellArgs = hasEnv("SHELL_ARGS") ? listEnv("SHELL_ARGS") : inferShellArgs(shellBin);
@@ -110,9 +123,24 @@ export const config = {
   tailscaleOnly: boolEnv("TAILSCALE_ONLY", false),
   trustedCidrs: listEnv("TRUSTED_CIDRS"),
   wsHeartbeatMs: intEnv("WS_HEARTBEAT_SECONDS", 30) * 1000,
-  sessionBufferLimit: 250000,
+  // How far back a client can reconnect and still resume instead of rebuilding
+  // its terminal. An agent redrawing its screen burns through this quickly, and
+  // a rebuild costs the browser its scrollback, so the window is worth its
+  // memory: this is the cap per live session.
+  sessionBufferLimit: intEnv("SESSION_BUFFER_LIMIT", 4000000),
   dataDir: path.join(root, "data"),
   codexSessionsDir: env("CODEX_SESSIONS_DIR", path.join(home, ".codex", "sessions")),
   ccSessionsDir: env("CC_SESSIONS_DIR", path.join(home, ".claude", "projects")),
+  herdrEnabled: boolEnv("HERDR_ENABLED", true),
+  herdrBin: inferHerdrBin(),
+  herdrSocket: env("HERDR_SOCKET", ""),
+  // /orch integration (docs/orch-contract-v1.1.md). The scheduler writes its
+  // read model and Main Agent bindings under orchDir; the web side only ever
+  // reads files there and shells out to gh for cmd:* labels.
+  orchDir: env("ORCH_DIR", path.join(home, ".codex-cc-web-terminal", "orch")),
+  // Machine token for POST /api/orch/spawn. Unset means spawn is disabled and
+  // the scheduler falls back to nohup. Deliberately not ACCESS_TOKEN.
+  orchApiToken: env("ORCH_API_TOKEN", ""),
+  ghBin: env("GH_BIN", "gh"),
   timezone: env("DISPLAY_TIMEZONE", "Australia/Melbourne")
 };

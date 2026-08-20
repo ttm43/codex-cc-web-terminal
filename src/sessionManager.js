@@ -4,6 +4,12 @@ import path from "node:path";
 
 import pty from "node-pty";
 
+import {
+  consumeTerminalState,
+  createTerminalState,
+  renderTerminalStatePrefix
+} from "./terminalState.js";
+
 const shortTimeFormatterCache = new Map();
 
 function nowIso() {
@@ -33,6 +39,27 @@ function formatShortTimestamp(value, timezone) {
   const parts = getShortTimeFormatter(timezone).formatToParts(new Date(value));
   const get = (type) => parts.find((part) => part.type === type)?.value || "00";
   return `${get("month")}-${get("day")} ${get("hour")}:${get("minute")} ${get("timeZoneName")}`;
+}
+
+// The ring buffer drops raw bytes off the front, and the bytes a session writes
+// first are exactly the ones that set the terminal up. Feed everything we drop
+// through the state tracker so a full replay can be prefixed with it, and never
+// leave the retained buffer starting inside a sequence whose head we discarded.
+function trimSessionBuffer(session, limit) {
+  // Trimming copies the whole retained buffer, so let it overshoot and cut back
+  // in one go instead of paying that copy on every chunk a busy agent writes.
+  if (session.buffer.length <= limit + Math.floor(limit / 4)) {
+    return;
+  }
+
+  let cut = session.buffer.length - limit;
+  consumeTerminalState(session.droppedState, session.buffer.slice(0, cut));
+  while (session.droppedState.pending && cut < session.buffer.length) {
+    consumeTerminalState(session.droppedState, session.buffer[cut]);
+    cut += 1;
+  }
+
+  session.buffer = session.buffer.slice(cut);
 }
 
 function quotePosix(value) {
@@ -67,7 +94,7 @@ function normalizeName(value, fallback) {
 
 function sanitizeTitleFragment(value) {
   return String(value || "")
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
+    .replace(/\u001b\[[<>0-9;?]*[ -/]*[@-~]/g, " ")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -76,7 +103,7 @@ function sanitizeTitleFragment(value) {
 function stripTerminalControlSequences(value) {
   return String(value || "")
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
+    .replace(/\u001b\[[<>0-9;?]*[ -/]*[@-~]/g, " ")
     .replace(/\u001b[@-_]/g, " ")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
@@ -243,10 +270,11 @@ function uniqueStrings(values) {
   return [...new Set(values.filter(Boolean).map((value) => String(value).trim().toLowerCase()))];
 }
 
-function buildPtyEnv() {
+function buildPtyEnv(extra = {}) {
   const env = {
     ...process.env,
-    TERM: "xterm-256color"
+    TERM: "xterm-256color",
+    ...extra
   };
   for (const key of [
     "CODEX_CI",
@@ -257,6 +285,21 @@ function buildPtyEnv() {
     delete env[key];
   }
   return env;
+}
+
+// Session metadata is written by machine callers (the orch scheduler) and read
+// back by browsers, so keep it a small flat bag of strings instead of trusting
+// arbitrary JSON.
+function sanitizeSessionMeta(meta) {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+
+  const entries = Object.entries(meta)
+    .slice(0, 16)
+    .filter(([key]) => /^[a-zA-Z0-9_-]{1,32}$/.test(key))
+    .map(([key, value]) => [key, sanitizeTitleFragment(String(value ?? "")).slice(0, 200)]);
+  return entries.length ? Object.fromEntries(entries) : null;
 }
 
 function customNameKey(providerId, resumeSessionId) {
@@ -510,7 +553,7 @@ export class SessionManager {
       cols: 120,
       rows: 30,
       cwd: resolvedCwd,
-      env: buildPtyEnv()
+      env: buildPtyEnv({ CODEX_CC_WEB_SESSION_ID: id })
     });
 
     const session = {
@@ -520,8 +563,14 @@ export class SessionManager {
       cliLabel: resolvedProvider.cliLabel,
       name: sessionName,
       cwd: resolvedCwd,
+      meta: null,
+      commandSession: false,
       shell,
       buffer: "",
+      // Total bytes the pty has ever written. buffer holds the tail of that
+      // stream, so it covers [streamBytes - buffer.length, streamBytes).
+      streamBytes: 0,
+      droppedState: createTerminalState(),
       status: "starting",
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -536,11 +585,89 @@ export class SessionManager {
       resumeSessionId: String(resumeSessionId || "").trim() || null
     };
 
-    shell.onData((chunk) => {
+    this.wireShellEvents(session);
+    this.sessions.set(id, session);
+    shell.write(`${this.buildProviderCommand(session)}\r`);
+    return this.serialize(session);
+  }
+
+  // POST /api/orch/spawn lands here: one PTY that runs a single command to
+  // completion (an orch worker), instead of an interactive provider bootstrap.
+  // The session still gets the full live-session lifecycle -- attachable,
+  // resumable, scrollback retained after exit -- which is the whole point of
+  // spawning workers here rather than under nohup.
+  createCommand({ command = "", cwd = "", meta = null, name = "" } = {}) {
+    const commandText = String(command || "").trim();
+    if (!commandText) {
+      throw new Error("command is required");
+    }
+
+    const requestedCwd = String(cwd || "").trim();
+    if (!requestedCwd) {
+      throw new Error("cwd is required");
+    }
+    const resolvedCwd = path.resolve(requestedCwd);
+    if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
+      // A worker pointed at a missing worktree must fail loudly so the
+      // scheduler can fall back, not silently run in defaultCwd.
+      throw new Error(`cwd does not exist: ${resolvedCwd}`);
+    }
+
+    const id = crypto.randomUUID();
+    const sanitizedMeta = sanitizeSessionMeta(meta);
+    const isWorker = sanitizedMeta?.kind === "worker";
+    const fallbackName = isWorker
+      ? `#${sanitizedMeta.ticket || "?"} ${sanitizedMeta.phase || "task"}`.trim()
+      : `cmd-${this.sessions.size + 1}`;
+    const shellArgs =
+      this.config.shellQuoteStyle === "powershell"
+        ? ["-NoLogo", "-Command", commandText]
+        : ["-l", "-c", commandText];
+    const shell = pty.spawn(this.config.shellBin, shellArgs, {
+      name: "xterm-color",
+      cols: 120,
+      rows: 30,
+      cwd: resolvedCwd,
+      env: buildPtyEnv({ CODEX_CC_WEB_SESSION_ID: id })
+    });
+
+    const session = {
+      id,
+      provider: "command",
+      providerLabel: isWorker ? "Worker" : "Command",
+      cliLabel: isWorker ? "Orch worker" : "Command",
+      name: normalizeName(name, fallbackName),
+      cwd: resolvedCwd,
+      meta: sanitizedMeta,
+      commandSession: true,
+      shell,
+      buffer: "",
+      streamBytes: 0,
+      droppedState: createTerminalState(),
+      status: "running",
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      exitCode: null,
+      clients: new Set(),
+      autoNamed: false,
+      fallbackName,
+      inputPreview: "",
+      sawBootstrapCommand: true,
+      bootstrapNames: [],
+      claudeStartupStage: 2,
+      resumeSessionId: null
+    };
+
+    this.wireShellEvents(session);
+    this.sessions.set(id, session);
+    return this.serialize(session);
+  }
+
+  wireShellEvents(session) {
+    session.shell.onData((chunk) => {
       session.buffer += chunk;
-      if (session.buffer.length > this.config.sessionBufferLimit) {
-        session.buffer = session.buffer.slice(-this.config.sessionBufferLimit);
-      }
+      session.streamBytes += chunk.length;
+      trimSessionBuffer(session, this.config.sessionBufferLimit);
       session.status = "running";
       session.updatedAt = nowIso();
       this.maybeAutoAdvanceClaudeStartup(session);
@@ -549,35 +676,45 @@ export class SessionManager {
       }
     });
 
-    shell.onExit(({ exitCode }) => {
+    session.shell.onExit(({ exitCode }) => {
       session.exitCode = exitCode;
       session.status = "exited";
       session.updatedAt = nowIso();
-      if (!this.persistSessionName(session)) {
+      // Command sessions have no provider history to attach a name to.
+      if (!session.commandSession && !this.persistSessionName(session)) {
         this.scheduleDeferredNamePersistence(session);
       }
       for (const client of session.clients) {
         client.send(JSON.stringify({ type: "exit", exitCode }));
       }
     });
-
-    this.sessions.set(id, session);
-    shell.write(`${this.buildProviderCommand(session)}\r`);
-    return this.serialize(session);
   }
 
-  attachClient(id, ws) {
+  // A client that still holds this session's output passes the stream offset it
+  // reached. If that offset is still inside the ring buffer it only gets what
+  // it missed and keeps its scrollback; otherwise it rebuilds from the retained
+  // tail, which needs the setup sequences that fell out of the buffer prepended
+  // to it.
+  attachClient(id, ws, { since = null } = {}) {
     const session = this.get(id);
     if (!session) {
       throw new Error(`Session not found: ${id}`);
     }
+
+    const bufferStart = session.streamBytes - session.buffer.length;
+    const resumable =
+      Number.isInteger(since) && since >= bufferStart && since <= session.streamBytes;
 
     session.clients.add(ws);
     ws.send(
       JSON.stringify({
         type: "snapshot",
         session: this.serialize(session),
-        buffer: session.buffer
+        buffer: resumable
+          ? session.buffer.slice(since - bufferStart)
+          : renderTerminalStatePrefix(session.droppedState) + session.buffer,
+        reset: !resumable,
+        streamOffset: session.streamBytes
       })
     );
 
@@ -602,6 +739,12 @@ export class SessionManager {
     const session = this.get(id);
     if (!session) {
       throw new Error(`Session not found: ${id}`);
+    }
+
+    // Viewing a finished session (an exited orch worker's scrollback) still
+    // sends resizes; the pty is gone and node-pty would throw ENOTTY.
+    if (session.status === "exited") {
+      return;
     }
 
     session.shell.resize(Math.max(20, cols || 120), Math.max(10, rows || 30));
@@ -672,6 +815,7 @@ export class SessionManager {
       cliLabel: session.cliLabel,
       name: session.name,
       cwd: session.cwd,
+      meta: session.meta || null,
       kind: "live",
       status: session.status,
       createdAt: session.createdAt,

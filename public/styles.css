@@ -1220,17 +1220,66 @@ html.touch-input-mode.terminal-layer-mode #terminal {
 #terminal .xterm-viewport {
   overflow-y: auto !important;
   -webkit-overflow-scrolling: touch;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.22) rgba(255, 255, 255, 0.05);
+  scrollbar-width: none;
 }
 
 #terminal .xterm-viewport::-webkit-scrollbar {
-  width: 8px;
+  width: 0;
+  height: 0;
 }
 
-#terminal .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.22);
+/* One scrollbar for both scroll models. Over local scrollback it shows and
+   drags like a normal positional bar; when the CLI owns the screen (alt
+   buffer) it becomes a jog handle whose drag is translated into wheel
+   events for the application to scroll itself. */
+.terminal-scrollbar {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  right: 0;
+  width: 22px;
+  z-index: 30;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease;
+  touch-action: none;
+}
+
+.terminal-scrollbar.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.terminal-scrollbar-thumb {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  width: 8px;
+  min-height: 36px;
   border-radius: 999px;
+  background: rgba(255, 255, 255, 0.42);
+  box-shadow: 0 0 0 1px rgba(17, 19, 24, 0.55);
+}
+
+.terminal-scrollbar.jog .terminal-scrollbar-thumb {
+  background: rgba(96, 165, 250, 0.55);
+}
+
+.terminal-scrollbar.dragging .terminal-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.terminal-scrollbar.jog.dragging .terminal-scrollbar-thumb {
+  background: rgba(96, 165, 250, 0.85);
+}
+
+html.touch-input-mode .terminal-scrollbar {
+  width: 30px;
+}
+
+html.touch-input-mode .terminal-scrollbar-thumb {
+  width: 11px;
+  right: 5px;
 }
 
 .mobile-composer {
@@ -2225,6 +2274,12 @@ html.mobile-composer-disabled.touch-input-mode .ime-bridge {
 .terminal-page #terminal .xterm-viewport {
   overflow-y: auto !important;
   -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.terminal-page #terminal .xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .terminal-page .keyboard-bridge {

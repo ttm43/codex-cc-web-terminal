@@ -72,6 +72,8 @@ const clipboardBuffer = document.getElementById("clipboard-buffer");
 const clipboardPrimaryButton = document.getElementById("clipboard-primary");
 const clipboardCloseButton = document.getElementById("clipboard-close");
 const terminalArrowButtons = [...document.querySelectorAll(".terminal-arrow-key")];
+const terminalScrollbarRoot = document.getElementById("terminal-scrollbar");
+const terminalScrollbarThumb = document.getElementById("terminal-scrollbar-thumb");
 
 let accessToken = "";
 let activeSessionId = "";
@@ -82,6 +84,11 @@ let reconnectTimer = null;
 let isManualDisconnect = false;
 const ignoredSocketEvents = new WeakSet();
 let isAuthenticated = false;
+// Which session's output the terminal currently holds, and how far into that
+// session's stream it has been written. Together they decide whether a
+// reconnect can pick up where it left off or has to rebuild the screen.
+let terminalSessionId = "";
+let terminalStreamOffset = 0;
 let pendingOutput = "";
 let outputFrame = null;
 let viewportFrame = null;
@@ -376,6 +383,21 @@ function flushPendingOutput() {
   if (wasAtBottom) {
     scrollTerminalToLatest({ force: true });
   }
+  layoutTerminalScrollbar();
+}
+
+// Clearing the screen invalidates the resume offset with it: whatever the
+// server would send from that point on would land on top of nothing.
+function resetTerminalContent() {
+  pendingOutput = "";
+  if (outputFrame !== null) {
+    window.cancelAnimationFrame(outputFrame);
+    outputFrame = null;
+  }
+  term.reset();
+  terminalSessionId = "";
+  terminalStreamOffset = 0;
+  layoutTerminalScrollbar();
 }
 
 function queueTerminalOutput(chunk) {
@@ -447,6 +469,319 @@ function scrollTerminalToLatest({ ensureVisible = false, force = false } = {}) {
     window.setTimeout(run, 220);
   });
 }
+
+// --- Scrolling the terminal by touch, and the overlay scrollbar ------------
+//
+// There are two scroll models. In the normal buffer, history lives in xterm's
+// scrollback and both native touch scrolling and a positional scrollbar work
+// on it directly. In the alternate buffer (the claude CLI lives there) the
+// application owns its screen: xterm has no scrollback and, with mouse
+// reporting active, ignores touch entirely. Scrolling that screen means
+// speaking the application's language, and the one dialect every TUI speaks is
+// the mouse wheel: xterm forwards wheel events as wheel reports (or arrow
+// keys) for the application to scroll itself. So a swipe here is translated
+// into synthetic wheel events, one per line of finger travel, and the same
+// translation backs the scrollbar when it has no position to show.
+
+function terminalOwnsScrolling() {
+  return term.buffer?.active?.type === "alternate";
+}
+
+function terminalCellHeight() {
+  const rows = terminalRoot.querySelector(".xterm-rows");
+  const height = rows && term.rows > 0 ? rows.clientHeight / term.rows : 0;
+  return height > 4 ? height : 17;
+}
+
+function emitTerminalWheel(lines) {
+  const target = terminalRoot.querySelector(".xterm");
+  if (!target || !lines) {
+    return;
+  }
+
+  // Wheel reports carry a cell position, and xterm drops the event outright
+  // when the coordinates fall outside its screen. Aim at the screen's center.
+  const screen = terminalRoot.querySelector(".xterm-screen") || target;
+  const rect = screen.getBoundingClientRect();
+  const step = Math.sign(lines) * terminalCellHeight();
+  const count = Math.min(Math.abs(lines), 60);
+  for (let i = 0; i < count; i += 1) {
+    target.dispatchEvent(
+      new WheelEvent("wheel", {
+        deltaY: step,
+        deltaMode: 0,
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2
+      })
+    );
+  }
+}
+
+const touchScroll = {
+  tracking: false,
+  lastY: 0,
+  lastTime: 0,
+  remainder: 0,
+  velocity: 0,
+  flingFrame: null
+};
+
+function stopTerminalFling() {
+  if (touchScroll.flingFrame !== null) {
+    window.cancelAnimationFrame(touchScroll.flingFrame);
+    touchScroll.flingFrame = null;
+  }
+}
+
+// Momentum for the synthetic path: without it, one screen of claude history
+// costs a full swipe. Decay tuned to feel like a plain list fling.
+function startTerminalFling() {
+  if (Math.abs(touchScroll.velocity) < 0.35) {
+    return;
+  }
+
+  let velocity = touchScroll.velocity;
+  let remainder = 0;
+  let lastTime = performance.now();
+  const stepFrame = (now) => {
+    touchScroll.flingFrame = null;
+    if (!terminalOwnsScrolling() || !hasLiveSession()) {
+      return;
+    }
+
+    const elapsed = Math.min(64, Math.max(1, now - lastTime));
+    lastTime = now;
+    remainder += velocity * elapsed;
+    velocity *= Math.pow(0.945, elapsed / 16);
+    const cell = terminalCellHeight();
+    const lines = Math.trunc(remainder / cell);
+    remainder -= lines * cell;
+    emitTerminalWheel(lines);
+    if (Math.abs(velocity) > 0.05) {
+      touchScroll.flingFrame = window.requestAnimationFrame(stepFrame);
+    }
+  };
+  touchScroll.flingFrame = window.requestAnimationFrame(stepFrame);
+}
+
+terminalRoot.addEventListener(
+  "touchstart",
+  (ev) => {
+    stopTerminalFling();
+    showTerminalScrollbar();
+    if (!terminalOwnsScrolling() || ev.touches.length !== 1) {
+      touchScroll.tracking = false;
+      return;
+    }
+
+    touchScroll.tracking = true;
+    touchScroll.lastY = ev.touches[0].clientY;
+    touchScroll.lastTime = ev.timeStamp;
+    touchScroll.remainder = 0;
+    touchScroll.velocity = 0;
+  },
+  { passive: true }
+);
+
+terminalRoot.addEventListener(
+  "touchmove",
+  (ev) => {
+    if (!touchScroll.tracking) {
+      return;
+    }
+    if (!terminalOwnsScrolling() || ev.touches.length !== 1 || !hasLiveSession()) {
+      touchScroll.tracking = false;
+      return;
+    }
+
+    const y = ev.touches[0].clientY;
+    const delta = touchScroll.lastY - y;
+    const elapsed = Math.max(1, ev.timeStamp - touchScroll.lastTime);
+    touchScroll.velocity = 0.75 * (delta / elapsed) + 0.25 * touchScroll.velocity;
+    touchScroll.lastY = y;
+    touchScroll.lastTime = ev.timeStamp;
+    touchScroll.remainder += delta;
+    const cell = terminalCellHeight();
+    const lines = Math.trunc(touchScroll.remainder / cell);
+    touchScroll.remainder -= lines * cell;
+    emitTerminalWheel(lines);
+    showTerminalScrollbar();
+    // The gesture belongs to the application now; anything the browser would
+    // do with it (rubber-banding, pull-to-refresh) only fights the scroll.
+    ev.preventDefault();
+  },
+  { passive: false }
+);
+
+const endTouchScroll = () => {
+  if (touchScroll.tracking) {
+    touchScroll.tracking = false;
+    startTerminalFling();
+  }
+};
+terminalRoot.addEventListener("touchend", endTouchScroll, { passive: true });
+terminalRoot.addEventListener("touchcancel", endTouchScroll, { passive: true });
+
+let scrollbarFadeTimer = null;
+let scrollbarDrag = null;
+
+function terminalScrollbarMode() {
+  if (terminalOwnsScrolling()) {
+    return "jog";
+  }
+
+  const buffer = term.buffer?.active;
+  return buffer && buffer.baseY > 0 ? "position" : "none";
+}
+
+function layoutTerminalScrollbar() {
+  if (!terminalScrollbarRoot || !terminalScrollbarThumb) {
+    return;
+  }
+
+  const mode = terminalScrollbarMode();
+  terminalScrollbarRoot.classList.toggle("jog", mode === "jog");
+  if (mode === "none") {
+    terminalScrollbarRoot.classList.remove("visible", "dragging");
+    return;
+  }
+
+  const track = terminalScrollbarRoot.clientHeight;
+  if (track <= 0) {
+    return;
+  }
+
+  if (mode === "position") {
+    const buffer = term.buffer.active;
+    const thumbHeight = Math.min(
+      track,
+      Math.max(36, Math.round((track * term.rows) / buffer.length))
+    );
+    const maxTop = track - thumbHeight;
+    const top = buffer.baseY > 0 ? Math.round((maxTop * buffer.viewportY) / buffer.baseY) : maxTop;
+    terminalScrollbarThumb.style.height = `${thumbHeight}px`;
+    terminalScrollbarThumb.style.top = `${Math.max(0, Math.min(maxTop, top))}px`;
+    return;
+  }
+
+  // Jog mode has no position to show: a fixed handle rides mid-track, follows
+  // the finger while dragging, and springs back on release.
+  const thumbHeight = Math.min(track, 56);
+  const maxTop = track - thumbHeight;
+  const restingTop = Math.round(maxTop / 2);
+  const top = scrollbarDrag && scrollbarDrag.mode === "jog"
+    ? Math.max(0, Math.min(maxTop, scrollbarDrag.jogTop))
+    : restingTop;
+  terminalScrollbarThumb.style.height = `${thumbHeight}px`;
+  terminalScrollbarThumb.style.top = `${top}px`;
+}
+
+function showTerminalScrollbar() {
+  if (!terminalScrollbarRoot || terminalScrollbarMode() === "none") {
+    return;
+  }
+
+  layoutTerminalScrollbar();
+  terminalScrollbarRoot.classList.add("visible");
+  if (scrollbarFadeTimer !== null) {
+    window.clearTimeout(scrollbarFadeTimer);
+  }
+  scrollbarFadeTimer = window.setTimeout(() => {
+    scrollbarFadeTimer = null;
+    if (!scrollbarDrag) {
+      terminalScrollbarRoot.classList.remove("visible");
+    }
+  }, 1600);
+}
+
+function scrollTerminalToFraction(clientY) {
+  const rect = terminalScrollbarRoot.getBoundingClientRect();
+  const thumbHeight = terminalScrollbarThumb.getBoundingClientRect().height;
+  const span = rect.height - thumbHeight;
+  if (span <= 0) {
+    return;
+  }
+
+  const top = clientY - rect.top - scrollbarDrag.grabOffset;
+  const fraction = Math.max(0, Math.min(1, top / span));
+  term.scrollToLine(Math.round(fraction * term.buffer.active.baseY));
+}
+
+terminalScrollbarRoot?.addEventListener("pointerdown", (ev) => {
+  const mode = terminalScrollbarMode();
+  if (mode === "none") {
+    return;
+  }
+
+  stopTerminalFling();
+  terminalScrollbarRoot.setPointerCapture(ev.pointerId);
+  const thumbRect = terminalScrollbarThumb.getBoundingClientRect();
+  const onThumb = ev.clientY >= thumbRect.top && ev.clientY <= thumbRect.bottom;
+  scrollbarDrag = {
+    mode,
+    pointerId: ev.pointerId,
+    lastY: ev.clientY,
+    remainder: 0,
+    jogTop: thumbRect.top - terminalScrollbarRoot.getBoundingClientRect().top,
+    grabOffset: onThumb ? ev.clientY - thumbRect.top : thumbRect.height / 2
+  };
+  terminalScrollbarRoot.classList.add("dragging");
+  if (mode === "position") {
+    scrollTerminalToFraction(ev.clientY);
+  }
+  showTerminalScrollbar();
+  ev.preventDefault();
+});
+
+terminalScrollbarRoot?.addEventListener("pointermove", (ev) => {
+  if (!scrollbarDrag || ev.pointerId !== scrollbarDrag.pointerId) {
+    return;
+  }
+
+  if (scrollbarDrag.mode === "position") {
+    scrollTerminalToFraction(ev.clientY);
+  } else if (hasLiveSession()) {
+    const delta = ev.clientY - scrollbarDrag.lastY;
+    scrollbarDrag.lastY = ev.clientY;
+    scrollbarDrag.jogTop += delta;
+    scrollbarDrag.remainder += delta;
+    const cell = terminalCellHeight();
+    const lines = Math.trunc(scrollbarDrag.remainder / cell);
+    scrollbarDrag.remainder -= lines * cell;
+    emitTerminalWheel(lines);
+    layoutTerminalScrollbar();
+  }
+  showTerminalScrollbar();
+  ev.preventDefault();
+});
+
+const endScrollbarDrag = (ev) => {
+  if (!scrollbarDrag || ev.pointerId !== scrollbarDrag.pointerId) {
+    return;
+  }
+
+  scrollbarDrag = null;
+  terminalScrollbarRoot.classList.remove("dragging");
+  layoutTerminalScrollbar();
+  showTerminalScrollbar();
+};
+terminalScrollbarRoot?.addEventListener("pointerup", endScrollbarDrag);
+terminalScrollbarRoot?.addEventListener("pointercancel", endScrollbarDrag);
+
+term.onScroll(() => {
+  layoutTerminalScrollbar();
+  showTerminalScrollbar();
+});
+
+terminalRoot.addEventListener(
+  "wheel",
+  () => {
+    showTerminalScrollbar();
+  },
+  { passive: true }
+);
 
 function settleTerminalViewport() {
   let firstPass = true;
@@ -1114,6 +1449,14 @@ function buildSessionCard(session) {
   if (session.kind === "history") {
     badgeRow.appendChild(buildBadge("Saved", "ghost-badge"));
   }
+  if (session.meta?.kind === "worker") {
+    badgeRow.appendChild(
+      buildBadge(
+        [session.meta.ticket ? `#${session.meta.ticket}` : "", session.meta.phase || ""].join(" ").trim() || "orch",
+        "ghost-badge"
+      )
+    );
+  }
   head.appendChild(badgeRow);
   card.appendChild(head);
 
@@ -1287,7 +1630,7 @@ function scheduleReconnect(sessionId = activeSessionId) {
     }
 
     try {
-      await connectToSession(targetSessionId, { resetTerminal: true, allowReconnect: true });
+      await connectToSession(targetSessionId, { allowReconnect: true });
     } catch (err) {
       setStatus(err.message || String(err));
       scheduleReconnect(targetSessionId);
@@ -1295,7 +1638,7 @@ function scheduleReconnect(sessionId = activeSessionId) {
   }, 600);
 }
 
-async function connectToSession(sessionId, { resetTerminal = true, allowReconnect = false } = {}) {
+async function connectToSession(sessionId, { allowReconnect = false } = {}) {
   clearReconnectTimer();
   if (socket) {
     const currentSocket = socket;
@@ -1312,19 +1655,21 @@ async function connectToSession(sessionId, { resetTerminal = true, allowReconnec
   setWorkspaceScreen("terminal");
   setPanelOpen(false);
 
-  if (resetTerminal) {
-    pendingOutput = "";
-    if (outputFrame !== null) {
-      window.cancelAnimationFrame(outputFrame);
-      outputFrame = null;
-    }
-    term.reset();
+  // Reconnecting to the session already on screen keeps that screen: term.reset()
+  // would throw away a scrollback the server cannot rebuild, since all it has is
+  // the tail of the raw stream. Switching sessions still clears, so the old
+  // session's output is not left sitting under the new one's.
+  const resumeOffset = terminalSessionId === sessionId ? terminalStreamOffset : null;
+  if (resumeOffset === null) {
+    resetTerminalContent();
   }
 
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(
-    `${protocol}://${window.location.host}/ws?sessionId=${encodeURIComponent(sessionId)}`
-  );
+  const query = new URLSearchParams({ sessionId });
+  if (resumeOffset !== null) {
+    query.set("since", String(resumeOffset));
+  }
+  const ws = new WebSocket(`${protocol}://${window.location.host}/ws?${query}`);
   socket = ws;
 
   ws.addEventListener("open", async () => {
@@ -1342,17 +1687,31 @@ async function connectToSession(sessionId, { resetTerminal = true, allowReconnec
   });
 
   ws.addEventListener("message", async (event) => {
+    // A superseded socket can still deliver what it had already buffered, and
+    // counting those bytes would leave the resume offset pointing at output
+    // this terminal never showed.
+    if (socket !== ws) {
+      return;
+    }
+
     const payload = JSON.parse(event.data);
     if (payload.type === "snapshot") {
       activeSession = payload.session || activeSession;
       updateWorkspaceSummary();
+      if (payload.reset) {
+        resetTerminalContent();
+      }
+      terminalSessionId = sessionId;
+      terminalStreamOffset = Number.isInteger(payload.streamOffset) ? payload.streamOffset : 0;
       queueTerminalOutput(payload.buffer || "");
       scrollTerminalToLatest({ force: true });
       setStatus(payload.session.status || "running");
       return;
     }
     if (payload.type === "data") {
-      queueTerminalOutput(payload.data || "");
+      const data = payload.data || "";
+      terminalStreamOffset += data.length;
+      queueTerminalOutput(data);
       return;
     }
     if (payload.type === "exit") {
@@ -1391,7 +1750,7 @@ async function connectToSession(sessionId, { resetTerminal = true, allowReconnec
 
 async function openSession(sessionId) {
   isManualDisconnect = false;
-  await connectToSession(sessionId, { resetTerminal: true, allowReconnect: true });
+  await connectToSession(sessionId, { allowReconnect: true });
   await loadDirectory(activeSession?.cwd || "");
 }
 
@@ -1683,6 +2042,57 @@ async function browseToParentDirectory() {
   await loadDirectory(browserState.parentPath);
 }
 
+async function enterWorkspace(payload) {
+  defaultCwd = payload.defaultCwd || "";
+  displayTimezone = payload.timezone || displayTimezone;
+  displayTimeFormatter = null;
+  displayCardTimeFormatter = null;
+  defaultProvider = payload.defaultProvider || defaultProvider;
+  applyProviderCatalog(payload.providers || []);
+  cwdInput.value = cwdInput.value.trim() || payload.defaultCwd || "";
+  providerSelect.value = providerCatalog.some((provider) => provider.id === defaultProvider)
+    ? defaultProvider
+    : providerCatalog[0]?.id || "codex";
+  newSessionButton.disabled = false;
+  setView("workspace");
+  setWorkspaceScreen("home");
+  setPanelOpen(false);
+  setStatus("Connected. Create or open a thread.");
+  await refreshSessions();
+  await loadDirectory(cwdInput.value.trim());
+  updateInputControls();
+  await openDeepLinkedSession();
+}
+
+// /orch (and anything else) can hand off into a specific thread with
+// /?session=<live id>. Consume the parameter so a later reload of the tab
+// does not keep re-opening a thread that may be long gone.
+function takeDeepLinkedSessionId() {
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = String(params.get("session") || "").trim();
+  if (!sessionId) {
+    return "";
+  }
+  params.delete("session");
+  const query = params.toString();
+  window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+  return sessionId;
+}
+
+async function openDeepLinkedSession() {
+  const sessionId = takeDeepLinkedSessionId();
+  if (!sessionId) {
+    return;
+  }
+
+  const target = sessions.find((session) => session.kind === "live" && session.id === sessionId);
+  if (!target) {
+    setStatus("Linked thread not found. It may have exited and been cleaned up.");
+    return;
+  }
+  await openSession(sessionId);
+}
+
 connectButton.addEventListener("click", async () => {
   try {
     accessToken = tokenInput.value.trim();
@@ -1693,24 +2103,7 @@ connectButton.addEventListener("click", async () => {
     const payload = await request("/api/config");
     accessToken = "";
     tokenInput.value = "";
-    defaultCwd = payload.defaultCwd || "";
-    displayTimezone = payload.timezone || displayTimezone;
-    displayTimeFormatter = null;
-    displayCardTimeFormatter = null;
-    defaultProvider = payload.defaultProvider || defaultProvider;
-    applyProviderCatalog(payload.providers || []);
-    cwdInput.value = cwdInput.value.trim() || payload.defaultCwd || "";
-    providerSelect.value = providerCatalog.some((provider) => provider.id === defaultProvider)
-      ? defaultProvider
-      : providerCatalog[0]?.id || "codex";
-    newSessionButton.disabled = false;
-    setView("workspace");
-    setWorkspaceScreen("home");
-    setPanelOpen(false);
-    setStatus("Connected. Create or open a thread.");
-    await refreshSessions();
-    await loadDirectory(cwdInput.value.trim());
-    updateInputControls();
+    await enterWorkspace(payload);
   } catch (err) {
     setStatus(err.message || String(err));
   }
@@ -1743,8 +2136,7 @@ closeSessionButton.addEventListener("click", async () => {
     await request(`/api/sessions/${activeSessionId}`, { method: "DELETE" });
     disconnectSocket();
     closeSessionNameEditor();
-    pendingOutput = "";
-    term.reset();
+    resetTerminalContent();
     activeSessionId = "";
     activeSession = null;
     updateInputControls();
@@ -1781,7 +2173,7 @@ backToConnectButton.addEventListener("click", () => {
   setPanelOpen(false);
   setWorkspaceScreen("home");
   setView("connect");
-  term.reset();
+  resetTerminalContent();
   setStatus("Disconnected");
   logoutSession();
   updateWorkspaceSummary();
@@ -1795,7 +2187,7 @@ backToSessionsButton.addEventListener("click", async () => {
   activeSession = null;
   setPanelOpen(false);
   setWorkspaceScreen("home");
-  term.reset();
+  resetTerminalContent();
   await refreshSessions();
   setStatus("Choose another thread.");
 });
@@ -1909,11 +2301,17 @@ if (enableMobileComposer) {
   });
 }
 
-if (!useImeBridge) {
-  term.onData((data) => {
-    sendToSession(data);
-  });
-}
+term.onData((data) => {
+  // On touch devices typed text arrives via the IME bridge, so plain
+  // characters from xterm's own input path would double up and are dropped.
+  // Control reports are different: the terminal is their only source (mouse
+  // wheel reports, wheel-to-arrow conversion), so they always go through --
+  // scrolling a full-screen CLI depends on them.
+  if (useImeBridge && !data.startsWith("\u001b")) {
+    return;
+  }
+  sendToSession(data);
+});
 
 term.onResize(() => {
   sendTerminalResize();
@@ -2091,3 +2489,15 @@ setWorkspaceScreen("home");
 setPanelOpen(false);
 syncComposerLayout();
 requestViewportMetrics();
+
+// A valid auth cookie should land straight in the workspace instead of asking
+// for the token again -- deep links from /orch depend on this hop being silent.
+(async () => {
+  try {
+    const payload = await request("/api/config");
+    isAuthenticated = true;
+    await enterWorkspace(payload);
+  } catch {
+    // No live cookie; stay on the connect view.
+  }
+})();

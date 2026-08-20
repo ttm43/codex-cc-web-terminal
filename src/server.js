@@ -356,6 +356,13 @@ function parseJson(body) {
   return JSON.parse(body);
 }
 
+// How far into a session's output stream a reconnecting client already is.
+// Anything unparseable means "start me over".
+function parseStreamOffset(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function resolveBrowserPath(rawPath) {
   const requested = String(rawPath || "").trim();
   const resolved = path.resolve(requested || config.defaultCwd);
@@ -746,14 +753,14 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (ws, req, sessionId) => {
+wss.on("connection", (ws, req, sessionId, since) => {
   ws.isAlive = true;
   ws.on("pong", () => {
     ws.isAlive = true;
   });
 
   try {
-    sessionManager.attachClient(sessionId, ws);
+    sessionManager.attachClient(sessionId, ws, { since });
   } catch (err) {
     ws.send(JSON.stringify({ type: "error", error: err?.message || String(err) }));
     ws.close();
@@ -821,8 +828,9 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
+  const since = parseStreamOffset(url.searchParams.get("since"));
   wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req, sessionId);
+    wss.emit("connection", ws, req, sessionId, since);
   });
 });
 
